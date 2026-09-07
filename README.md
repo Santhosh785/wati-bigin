@@ -17,13 +17,17 @@ project, which now keeps only the Node/Express + MongoDB side.
 | `campaign_retry.py` | **The second chance** — a week after a campaign finishes, its failed leads become a fresh campaign. Opt-outs and dead numbers are never resent. |
 | `campaign_ui.py` | HTML for step 5 (send/schedule), the campaigns dashboard, and the delivery-webhook page. |
 | `wati_webhook.py` | **Delivery receipts** — takes WATI's webhook and turns it into delivered / read / replied / blocked-by-Meta. |
+| `session_store.py` | **Where a browser's wizard state lives** between requests — MongoDB, or a dict when there is no Mongo. This is what lets the app run on a host where no process survives a request. |
+| `cron_jobs.py` | The background work (send tick, retry sweep, Bigin sync) as endpoints a scheduler can call. Used by Vercel Cron; harmless everywhere else. |
+| `vercel.json`, `requirements.txt`, `api/`, `public/` | The Vercel deployment — see [Hosting on Vercel](#hosting-on-vercel). Ignored when you run `app.py` yourself. |
+| `vercel_boot.py` | The few adjustments a serverless function needs that a server does not (line-buffered logs, a writable temp dir). Imported by every entrypoint under `api/`. |
 | `ui.py` | **The design system** — palette, fonts, and every shared button/field/section. Change the look here, not in the two files above. |
 | `sample_bigin.csv` | Example Bigin export to test an upload against. |
 | `wati_cleanup.html` | Legacy standalone single-file version of the UI. Open it in a browser; needs no server. |
 | `deploy/wati.service` | systemd unit that runs `app.py`. |
 | `deploy/wati-bigin-sync.{service,timer}` | systemd timer that runs `bigin_sync.py` every 3 hours. |
 | `.env` | Zoho + Mongo + WATI credentials. Gitignored — never commit it. |
-| `server.js`, `package.json` | Pre-existing Express stub in this folder (port 8080), unrelated to the cleaner. |
+| `server.js`, `package.json` | Pre-existing Express stub in this folder (port 8080), unrelated to the cleaner. Excluded from the Vercel deployment by `.vercelignore`. |
 
 ## Run
 
@@ -98,6 +102,195 @@ delivery control changes.
 `app.py` itself is stdlib-only, but loading from Bigin needs **pymongo**. If it
 is missing the app still starts — the Bigin button simply reports why it is
 unavailable and CSV upload keeps working.
+
+## Hosting on Vercel
+
+The app also deploys to Vercel, with no separate branch and no second copy of
+the code: `python3 app.py` still runs the whole thing on a laptop or a VM
+exactly as before. What follows is what had to change to make one codebase do
+both, because two of those changes are things you can trip over later.
+
+### The two things that are genuinely different there
+
+**A function does not outlive its response.** That breaks a five-step wizard,
+which is what this app is: the process that serves step 2 is not the one that
+served step 1, so the rows uploaded in step 1 are simply gone. Sessions
+therefore moved out of the process into `session_store.py` — one gzipped JSON
+blob per browser in Mongo, expired by a TTL index, written *before* each
+response is flushed rather than after (a write queued after the last byte goes
+out is a write the platform is free to never run). Locally, with no
+`MONGO_URI`, it is still a plain dict and behaves as it always did.
+
+**There is no scheduler thread.** On a server, `campaign_runner` runs a daemon
+thread that walks a recipient list for as long as the list takes. A function
+gets a few minutes at most. So on Vercel the same walk is driven from outside:
+
+| Cron | Schedule | What it does |
+| --- | --- | --- |
+| `/api/cron/send` | every minute | `campaign_runner.tick_once()` — claim what is due and send until the time budget runs out. |
+| `/api/cron/retry` | hourly | The retry sweep: failed leads from campaigns whose week is up become fresh campaigns. |
+| `/api/cron/bigin` | every 3 hours | `bigin_sync.sync()` — the same run `deploy/bigin_sync_cron.sh` does on a VM. |
+
+A campaign too long for one tick is not restarted by the next one. It stops on
+a chunk boundary, goes back to `scheduled` with its cursor intact, and the next
+tick resumes from there — the log line reads *"Paused for the next tick at
+100/200 — the sending window ran out, not the campaign"*. Nobody is messaged
+twice, because it is the per-recipient status and not the cursor that decides
+what to send. A tick never returns while a send is still in flight, and a
+worker killed outright leaves a claim that any later tick may take over only
+once `WATI_CLAIM_LEASE_SECONDS` (default 900) has passed. That lease is the
+only thing standing between a crashed send and a duplicated one, so do not
+shorten it below the send function's `maxDuration`.
+
+### What it needs
+
+* **A MongoDB you can reach from Vercel** (`MONGO_URI`) — Atlas with network
+  access open to Vercel's IPs, or `0.0.0.0/0` plus a strong password. Not
+  optional here: it holds the sessions as well as the campaigns, and the local
+  JSON fallback on a serverless host is a per-instance file in `/tmp` that
+  vanishes with the instance.
+* **A Vercel Pro plan**, for one reason only: Hobby crons run at most once a
+  day, so `* * * * *` would not be honoured. On Hobby, either point an external
+  scheduler (cron-job.org, GitHub Actions, an existing box) at
+  `https://<your-app>/api/cron/send?key=$CRON_SECRET` every minute, or keep the
+  sending on a VM and put only the UI here.
+* **`CRON_SECRET`.** These endpoints start real sends. Without it they refuse
+  to run at all, which is deliberate — an open one is an open "message
+  everyone in the database" button. Vercel Cron presents it as
+  `Authorization: Bearer`; the `?key=` form exists for schedulers that cannot
+  set headers, and puts the secret in request logs, so prefer the header.
+
+### Deploying
+
+```bash
+npm i -g vercel
+vercel link                       # once, in this folder
+
+# Copy the .env values in. Do it for Production and Preview both, or a preview
+# deployment will come up with no database and no credentials.
+for k in ZOHO_CLIENT_ID ZOHO_CLIENT_SECRET ZOHO_REFRESH_TOKEN ZOHO_REGION \
+         ZOHO_PRODUCT MONGO_URI WATI_TOKEN WATI_API_URL WATI_WEBHOOK_TOKEN \
+         WATI_API_ENDPOINT WATI_API_TOKEN; do
+  vercel env add "$k" production
+done
+vercel env add CRON_SECRET production     # something long and random
+vercel env add PUBLIC_BASE_URL production # https://<your-app>.vercel.app
+
+vercel --prod
+```
+
+Crons only run on **production** deployments, so a preview URL will serve the
+UI but send nothing — which is exactly what you want from a preview, and worth
+remembering when a scheduled campaign on one does not go out.
+
+Deploying from the GitHub remote instead of the CLI works the same way; set the
+same variables in the project's settings.
+
+### Why `vercel.json` looks the way it does
+
+Four of its settings are not decoration — each one is a way this deploys
+wrong if it is missing.
+
+**`framework: null`.** The Vercel project was created for the old Express stub
+and its settings still say `express`, which makes the build hunt for a Node
+entrypoint and die on `Cannot read properties of undefined (reading 'fsPath')`.
+The vercel.json declaration overrides the project setting, so the repo is
+self-describing and nobody has to remember a dashboard toggle. Setting the
+preset to *Other* in the project's settings is worth doing anyway.
+
+**`outputDirectory: "public"`.** Everything outside `api/` is otherwise copied
+into the static half of the deployment and *served* — `https://<your-app>/app.py`
+would hand back the application source. Naming an output directory confines
+the static half to `public/` (which holds a robots.txt and nothing else). The
+modules the functions import are bundled into the functions themselves, not
+served, so this costs nothing.
+
+**`functions` with `includeFiles`.** Keeps the root modules — `app.py`,
+`campaign_runner.py`, everything they import — inside each function's bundle,
+and sets the memory and time limits per endpoint. The send tick gets the
+longest (`maxDuration` 300); a UI request needs 60.
+
+**Every entrypoint declares `class handler(...)` literally.** This is the
+sharpest edge in the whole deployment. Vercel decides whether a `.py` file
+under `api/` is a function by *reading the source* for a `handler` class, not
+by importing the module. The natural way to write these files —
+
+```python
+from app import Handler as handler        # looks right, silently is not
+handler = make_handler("send")            # same problem
+```
+
+— is invisible to that check. The file is then treated as a static asset: the
+build succeeds, the deployment comes up, and every route 404s while your source
+is downloadable. So each entrypoint subclasses instead:
+
+```python
+class handler(Handler):
+    pass
+```
+
+If a new endpoint ever appears to deploy but not exist, this is why.
+
+### The .env file is ignored on Vercel
+
+`.vercelignore` keeps it out of the upload, and `bigin_store._load_env` also
+refuses to read one when `VERCEL` is set. Both, deliberately: a `.env` that
+slipped into a bundle is a snapshot of whatever was on the machine that built
+it, and would quietly outlive the next credential rotation. On the platform,
+the platform's environment variables are the only source.
+
+Deploy with `vercel --prod` rather than `vercel deploy --prebuilt` for the same
+reason — a local prebuild does not apply `.vercelignore` to the function
+bundles.
+
+### After the first deploy
+
+```bash
+curl https://<your-app>/health                       # -> ok
+curl -H "Authorization: Bearer $CRON_SECRET" \
+     https://<your-app>/api/cron/send                # -> {"ok":true,"result":{...}}
+```
+
+Then open `/campaigns` and check the storage badge says MongoDB rather than a
+JSON file — a JSON badge means `MONGO_URI` did not reach the function, and
+every campaign you create will disappear with the instance that served it.
+
+Finally, repoint WATI's webhook at `https://<your-app>/webhooks/wati?token=…`
+(see [Setting it up](#setting-it-up)). Set `PUBLIC_BASE_URL` and the webhook
+page prints the right URL to paste; without it the page falls back to the
+forwarded host, which on a preview deployment is a URL that changes every push.
+
+### Environment variables Vercel adds to the picture
+
+| Variable | Default | What it is for |
+| --- | --- | --- |
+| `CRON_SECRET` | — | Required. Shared secret for `/api/cron/*`. |
+| `PUBLIC_BASE_URL` | forwarded host | The origin printed on the webhook page. |
+| `WATI_TICK_BUDGET` | `45` | Seconds one send tick may spend. Keep it well under the function's `maxDuration`. |
+| `WATI_CLAIM_LEASE_SECONDS` | `900` | How long a claim is trusted before another tick may take the campaign over. |
+| `WATI_DATA_DIR` | `/tmp/wati-data` on Vercel | Where the JSON fallback writes when Mongo is unreachable. |
+| `SESSION_TTL_SECONDS` | `7200` | Idle lifetime of a browser session. |
+
+`HOST` and `PORT` mean nothing on Vercel; the platform owns both.
+
+### Limits worth knowing before you rely on it
+
+* **A send starts within a minute, not instantly.** "Send now" marks the
+  campaign due and returns; the next tick starts it. Running the walk inside
+  the web request would mean a campaign killed mid-send at the request timeout,
+  with nothing left to record what happened.
+* **Throttling is per tick, not global.** A campaign's rate limiter lives for
+  one invocation, so a 60/minute campaign that spans three ticks is 60/minute
+  *while each tick runs*. It stays under the limit; it is not exact over the
+  hour the way the always-on thread is.
+* **A session is capped at 12 MB compressed** — roughly a few hundred thousand
+  rows. Over that, the generated CSVs are dropped first (press Generate again
+  to rebuild them) and then the save is refused with a message telling you to
+  filter the list down. On a VM there is no such ceiling.
+* **Every request pays a session read and, when something changed, a write.**
+  Unchanged requests skip the write.
+* **`deploy/` is for the VM story** — systemd units and the cron wrapper. It is
+  excluded from the deployment and is not what runs here.
 
 ## Relationship to `wati_cleanup`
 
@@ -547,3 +740,4 @@ themselves are stamped on the campaign and its recipients, and are permanent.
 The results CSV carries them per contact — delivered, read, replied, the reply
 text, and Meta's reason.
 # wati_cleanup
+# wati-bigin
