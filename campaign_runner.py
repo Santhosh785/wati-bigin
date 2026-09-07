@@ -52,17 +52,42 @@ CHUNK_SECONDS = 20              # …but small enough that a chunk lasts ~this l
 # The retry sweep answers a question about days, so asking it every 15 seconds
 # alongside the send scheduler would be thousands of pointless queries a day.
 RETRY_SWEEP_SECONDS = max(30, int(os.environ.get("WATI_RETRY_SWEEP_SECONDS", "300")))
+# How long a claim is trusted before another worker may take the campaign back.
+# Only matters where a worker can be killed mid-walk without unwinding — a
+# serverless function hitting its time limit. Must be comfortably longer than
+# one tick's budget, or two workers would fight over the same list.
+CLAIM_LEASE_SECONDS = max(120, int(os.environ.get("WATI_CLAIM_LEASE_SECONDS", "900")))
 
 
-def chunk_size(throttle):
+def _serverless():
+    """
+    True where nothing outlives a request, so there is no thread to hand work
+    to — the send walk is driven by `tick_once` from a cron instead.
+    """
+    return bool(os.environ.get("VERCEL"))
+
+
+def chunk_size(throttle, remaining=None):
     """
     Pause and cancel are checked between chunks, so the chunk has to be short
     in *time*, not just in count: at 30 messages/minute a 50-wide chunk would
     leave the user waiting 100 seconds after clicking Pause. Sizing the chunk to
     about CHUNK_SECONDS of work keeps the button responsive at any rate, while
     still batching enough to keep progress writes cheap.
+
+    `remaining` is how many seconds this walk is still allowed to run, and it
+    exists for one reason. Results are persisted per chunk, so a chunk killed
+    part-way through has sent messages that were never recorded — and those are
+    the only messages this design can ever send twice, because a resume sees
+    them as still pending. On a serverless host, being killed is routine rather
+    than exceptional, so a chunk is never planned to outlast the time left,
+    even if that means one message per chunk at a very low throttle.
     """
-    return max(5, min(CHUNK_MAX, int(max(1, throttle) * CHUNK_SECONDS / 60)))
+    n = max(5, min(CHUNK_MAX, int(max(1, throttle) * CHUNK_SECONDS / 60)))
+    if remaining is None:
+        return n
+    fits = int(max(1, throttle) * max(0.0, remaining) / 60)
+    return max(1, min(n, fits))
 
 # Identifies this process in a campaign's log, so a claim is traceable when
 # more than one app process shares the database.
@@ -163,18 +188,22 @@ def _tick():
             free -= 1
 
 
-def _launch(campaign_id):
+def _launch(campaign_id, deadline=None):
     """
     Claim a campaign and give it a thread. False if someone else got there
     first — the claim is atomic in the store, so a second app process pointed at
     the same database cannot start a duplicate walk through the same list.
+
+    `deadline` (a time.monotonic() value) caps how long the walk may run before
+    it hands the campaign back to whoever ticks next; None means "until done",
+    which is what the long-lived scheduler wants.
     """
     with _active_lock:
         if campaign_id in _active and _active[campaign_id].is_alive():
             return False
         if store.claim(campaign_id, WORKER_ID) is None:
             return False
-        t = threading.Thread(target=_run_campaign, args=(campaign_id,),
+        t = threading.Thread(target=_run_campaign, args=(campaign_id, deadline),
                              name=f"wati-campaign-{campaign_id[:8]}", daemon=True)
         _active[campaign_id] = t
         t.start()
@@ -182,9 +211,128 @@ def _launch(campaign_id):
 
 
 # --------------------------------------------------------------------------- #
+# the same tick, driven from outside (serverless)
+# --------------------------------------------------------------------------- #
+# On a normal host `_scheduler_loop` calls `_tick` forever and campaigns run to
+# completion in their own threads. Where no process outlives a request — Vercel
+# — a cron calls `tick_once` instead: same claim, same walk, same store, but
+# bounded by a wall-clock budget and joined before the function returns.
+#
+# Two things make that safe rather than merely possible:
+#
+# * A walk stopped by the budget goes back to 'scheduled' with its cursor
+#   intact, so the next tick resumes it. Nothing is re-sent: per-recipient
+#   status, not the cursor, is what decides.
+# * A walk killed outright (the platform hitting its hard limit) leaves the
+#   campaign 'running' with nobody working it. `adopt_stale` is what notices,
+#   after the claim lease expires — the lease is the only reason a second
+#   worker may take a campaign that still claims to be running.
+def adopt_stale(lease_seconds=None):
+    """
+    Return campaigns whose worker died mid-walk to 'scheduled'.
+
+    Deliberately conservative: a campaign is only reclaimed once its claim is
+    older than the lease, because the alternative — reclaiming on the next tick
+    — would hand a live campaign to a second sender and message people twice.
+    """
+    lease = lease_seconds or CLAIM_LEASE_SECONDS
+    now = dt.datetime.now(dt.timezone.utc)
+    adopted = []
+    for c in store.interrupted_campaigns():
+        cid = c.get("campaign_id")
+        if not cid:
+            continue
+        with _active_lock:
+            t = _active.get(cid)
+        if t is not None and t.is_alive():        # this process is working it
+            continue
+        claimed = c.get("claimed_at")
+        if isinstance(claimed, str):
+            try:
+                claimed = dt.datetime.fromisoformat(claimed)
+            except ValueError:
+                claimed = None
+        if isinstance(claimed, dt.datetime):
+            if claimed.tzinfo is None:
+                claimed = claimed.replace(tzinfo=dt.timezone.utc)
+            if (now - claimed).total_seconds() < lease:
+                continue                          # still inside its lease
+        try:
+            store.update(cid, {"status": "scheduled", "scheduled_at": store.now_utc()},
+                         log_msg=f"Adopted — the worker that claimed it stopped reporting "
+                                 f"for over {int(lease)}s; resuming from the last saved position")
+            adopted.append(cid)
+        except Exception as e:                    # noqa: BLE001 — one bad doc must not stop the sweep
+            print(f"[wati-tick] could not adopt {cid[:8]}: {type(e).__name__}: {e}")
+    return adopted
+
+
+def tick_once(budget_seconds=45, lease_seconds=None):
+    """
+    One scheduler tick, start to finish, with nothing left running.
+
+    Returns a small dict for the cron endpoint to log. It must not return while
+    a send is still in flight: the platform freezes the instance the moment the
+    response goes out, and a frozen thread mid-chunk is exactly the case the
+    lease then has to clean up minutes later.
+    """
+    budget = max(5, int(budget_seconds))
+    deadline = time.monotonic() + budget
+    adopted = adopt_stale(lease_seconds)
+
+    launched = []
+    try:
+        due = store.due_campaigns()
+    except Exception as e:                        # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}", "adopted": adopted}
+
+    for c in due:
+        if len(launched) >= MAX_CONCURRENT or time.monotonic() >= deadline:
+            break
+        cid = c["campaign_id"]
+        if _launch(cid, deadline=deadline):
+            launched.append(cid)
+
+    # Joining is the whole point of this function existing.
+    for cid in launched:
+        with _active_lock:
+            t = _active.get(cid)
+        if t is None:
+            continue
+        # A worker stops at the next chunk boundary after the deadline, so it
+        # can overrun by up to one chunk (~CHUNK_SECONDS) plus its final write.
+        t.join(timeout=max(0.0, deadline - time.monotonic()) + CHUNK_SECONDS + 30)
+
+    still_running = []
+    for cid in launched:
+        with _active_lock:
+            t = _active.get(cid)
+        if t is not None and t.is_alive():
+            still_running.append(cid)
+
+    return {"due": len(due), "started": launched, "adopted": adopted,
+            "unjoined": still_running,
+            "seconds": round(budget - max(0.0, deadline - time.monotonic()), 1)}
+
+
+def retry_sweep_once():
+    """
+    The retry half of a tick, on its own schedule.
+
+    Separated from `tick_once` because the question it asks is about days, not
+    seconds: running it on every send tick would be thousands of pointless
+    queries a day, and the in-process throttle that prevents that
+    (`_last_retry_sweep`) resets on every cold start.
+    """
+    if not retry.enabled():
+        return {"skipped": "retries are disabled"}
+    return {"swept": retry.sweep(worker=WORKER_ID)}
+
+
+# --------------------------------------------------------------------------- #
 # the send walk
 # --------------------------------------------------------------------------- #
-def _run_campaign(campaign_id):
+def _run_campaign(campaign_id, deadline=None):
     doc = store.get(campaign_id)
     if not doc:
         return
@@ -194,7 +342,6 @@ def _run_campaign(campaign_id):
     dry_run = bool(doc.get("dry_run"))
     throttle = doc.get("throttle") or 60
     limiter = RateLimiter(throttle)
-    chunk = chunk_size(throttle)
 
     sent = int(doc.get("sent") or 0)
     failed = int(doc.get("failed") or 0)
@@ -207,8 +354,9 @@ def _run_campaign(campaign_id):
                if (recipients[i].get("status") or "pending") == "pending"]
 
     stopped_as = None
+    start_i = 0
     try:
-        for start_i in range(0, len(pending), chunk):
+        while start_i < len(pending):
             state = store.get(campaign_id) or {}
             if state.get("status") == "paused":
                 stopped_as = "paused"
@@ -216,8 +364,17 @@ def _run_campaign(campaign_id):
             if state.get("status") == "cancelled":
                 stopped_as = "cancelled"
                 break
+            # Out of time on a host that will not let this run any longer. Stop
+            # on a chunk boundary — progress is already persisted there — and
+            # let the next tick resume from the cursor. Checked before the
+            # chunk, never during one, so no send is ever left half-recorded.
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                stopped_as = "deadline"
+                break
 
-            batch = pending[start_i:start_i + chunk]
+            batch = pending[start_i:start_i + chunk_size(throttle, remaining)]
+            start_i += len(batch)
             results = {}
 
             def one(idx):
@@ -263,6 +420,14 @@ def _run_campaign(campaign_id):
         elif stopped_as == "cancelled":
             store.update(campaign_id, {"finished_at": store.now_utc()},
                          log_msg=f"Cancelled at {sent + failed}/{len(recipients)}")
+        elif stopped_as == "deadline":
+            # Back to 'scheduled', due now: that is the one state the next
+            # tick's claim() will pick up, and the cursor means it resumes
+            # rather than restarts.
+            store.update(campaign_id,
+                         {"status": "scheduled", "scheduled_at": store.now_utc()},
+                         log_msg=f"Paused for the next tick at {sent + failed}/{len(recipients)} "
+                                 f"— the sending window ran out, not the campaign")
         else:
             store.update(campaign_id,
                          {"status": "completed", "finished_at": store.now_utc()},
@@ -349,6 +514,12 @@ def send_now(campaign_id):
         return f"Campaign is already {doc['status']}."
     store.update(campaign_id, {"scheduled_at": store.now_utc(), "status": "scheduled"},
                  log_msg="Send-now requested")
+    if _serverless():
+        # Starting the walk here would run a whole campaign inside one HTTP
+        # request, which a serverless host kills at its time limit — mid-send,
+        # with no thread left to record what happened. The campaign is due as
+        # of now, so the next cron tick starts it instead.
+        return None
     _launch(campaign_id)
     return None
 
@@ -451,8 +622,22 @@ def is_running():
 
 
 def active_count():
+    """
+    Campaigns sending right now, for the header badge.
+
+    In-process when a thread is doing the sending. When a cron is, the sender
+    is a different process altogether and this process knows nothing about it —
+    so the store answers instead, or every page would claim nothing was
+    sending while a campaign was halfway through its list.
+    """
     with _active_lock:
-        return sum(1 for t in _active.values() if t.is_alive())
+        mine = sum(1 for t in _active.values() if t.is_alive())
+    if mine or not _serverless():
+        return mine
+    try:
+        return store.running_count()
+    except Exception:                             # noqa: BLE001 — a badge is not worth a 500
+        return 0
 
 
 def parse_ist(value):

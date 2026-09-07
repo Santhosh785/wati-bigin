@@ -55,7 +55,14 @@ import threading
 import uuid
 
 DB_COLLECTION = "wati_campaigns"
-JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "campaigns.json")
+# Where the JSON fallback writes. A serverless host mounts the deployment
+# read-only with only /tmp writable, hence the override — but note what a
+# per-instance file means there: it is not shared between instances and does
+# not survive one, so on such a host MONGO_URI is not optional. The fallback
+# only keeps the app answering while Mongo is down.
+DATA_DIR = (os.environ.get("WATI_DATA_DIR")
+            or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+JSON_PATH = os.path.join(DATA_DIR, "campaigns.json")
 
 ACTIVE_STATUSES = ("scheduled", "running", "paused")
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
@@ -132,7 +139,10 @@ def _init():
                 _backend_note = f"MongoDB unavailable ({e}); using {JSON_PATH}"
         else:
             _backend_note = f"MONGO_URI not set; using {JSON_PATH}"
-        os.makedirs(os.path.dirname(JSON_PATH), exist_ok=True)
+        try:
+            os.makedirs(os.path.dirname(JSON_PATH), exist_ok=True)
+        except OSError as e:                     # read-only filesystem
+            _backend_note = f"{_backend_note}; {os.path.dirname(JSON_PATH)} is not writable ({e})"
         _backend = "json"
         return _backend
 
@@ -385,6 +395,20 @@ def interrupted_campaigns():
             docs = [{k: v for k, v in _revive(d).items() if k != "recipients"}
                     for d in _json_read() if d.get("status") == "running"]
     return docs
+
+
+def running_count():
+    """
+    How many campaigns are mid-send, according to the store.
+
+    Cheap enough for a page header, and the only honest answer where the thing
+    doing the sending is a different process from the one rendering the page.
+    """
+    _init()
+    with _LOCK:
+        if _backend == "mongo":
+            return _db[DB_COLLECTION].count_documents({"status": "running"})
+        return sum(1 for d in _json_read() if d.get("status") == "running")
 
 
 def claim(campaign_id, worker):
@@ -795,7 +819,10 @@ def data_dir():
     """Where the JSON backend keeps its files — the webhook's fallback log
     lives here too, so there is one directory to gitignore and one to back up."""
     path = os.path.dirname(JSON_PATH)
-    os.makedirs(path, exist_ok=True)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:                              # read-only filesystem
+        pass
     return path
 
 

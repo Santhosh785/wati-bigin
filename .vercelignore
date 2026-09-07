@@ -1,0 +1,16 @@
+# Node leftovers from an earlier experiment — the deployed app is the Python one.
+node_modules/
+package.json
+package-lock.json
+server.js
+
+# A VM's deployment story, not this one.
+deploy/
+logs/
+data/
+
+__pycache__/
+*.pyc
+.env
+sample_bigin.csv
+wati_cleanup.html

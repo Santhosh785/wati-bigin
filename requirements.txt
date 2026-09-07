@@ -1,0 +1,4 @@
+# The app is standard library apart from this. `[srv]` pulls dnspython, which
+# is what a mongodb+srv:// URI needs to resolve — an Atlas connection string
+# fails without it.
+pymongo[srv]>=4.6,<5

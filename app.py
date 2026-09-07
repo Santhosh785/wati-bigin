@@ -6,8 +6,9 @@ Standard library only. Reuses the cleaning logic from wati_cleanup.py and
 serves HTML fragments that htmx swaps into the page.
 
 State is per-browser (cookie session), so many people can use it at once
-without clobbering each other. Sessions live in memory and are evicted
-after SESSION_TTL of inactivity.
+without clobbering each other. Sessions live in `session_store` — MongoDB when
+MONGO_URI is set (required on a serverless host, where no process outlives a
+request), otherwise a dict in this process.
 
 Config via environment:
     HOST   bind address   (default 127.0.0.1  — keep this behind a reverse proxy)
@@ -25,7 +26,6 @@ import json
 import os
 import re
 import secrets
-import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,6 +42,7 @@ from wati_cleanup import (
 
 # The Bigin mirror is optional: without pymongo (or without a reachable Mongo)
 # the app still runs and falls back to CSV upload.
+import session_store
 import ui
 
 try:
@@ -65,16 +66,20 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
 
 MAX_BODY = 50 * 1024 * 1024   # 50 MB upload cap
-SESSION_TTL = 2 * 60 * 60     # evict idle sessions after 2h
-MAX_SESSIONS = 500            # hard cap on concurrent sessions
+# Session lifetime and capacity now belong to session_store — it owns the
+# storage, so it owns the eviction (a Mongo TTL index, or the dict sweep).
 
 esc = html.escape
 
 # --------------------------------------------------------------------------- #
 # per-browser sessions
 # --------------------------------------------------------------------------- #
-SESSIONS = {}          # sid -> session dict
-LOCK = threading.Lock()
+# Sessions used to be a dict in this process, guarded by a lock. They live in
+# `session_store` now, because on a serverless host the process that serves
+# step 2 is not the one that served step 1 — see that module. With no
+# MONGO_URI it still is a dict, so nothing changes when you run this file
+# directly. The lock went with them: this module no longer shares mutable
+# state between threads.
 
 
 def new_session():
@@ -89,16 +94,6 @@ def new_session():
         "wati_rows": [],   # last generated recipient list, reused by step 5
         "last_seen": time.time(),
     }
-
-
-def _evict(now):
-    """Called under LOCK. Drop idle sessions, then cap total count."""
-    stale = [k for k, v in SESSIONS.items() if now - v["last_seen"] > SESSION_TTL]
-    for k in stale:
-        del SESSIONS[k]
-    if len(SESSIONS) > MAX_SESSIONS:
-        for k in sorted(SESSIONS, key=lambda k: SESSIONS[k]["last_seen"])[:len(SESSIONS) - MAX_SESSIONS]:
-            del SESSIONS[k]
 
 
 # --------------------------------------------------------------------------- #
@@ -623,27 +618,60 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "watihttpd/1.0"
 
     def get_session(self):
-        """Return this browser's session, creating one (and queuing a Set-Cookie) if needed."""
+        """
+        Return this browser's session, creating one (and queuing a Set-Cookie)
+        if needed.
+
+        Loaded at most once per request and cached on the handler: routes call
+        this freely, and every call has to hand back the *same* dict or a
+        mutation made by one call would be invisible to the next. `_persist`
+        writes it back when the route is done.
+        """
+        if getattr(self, "_sess", None) is not None:
+            return self._sess
         sid = None
         for part in self.headers.get("Cookie", "").split(";"):
             part = part.strip()
             if part.startswith("sid="):
                 sid = part[4:]
-        now = time.time()
-        with LOCK:
-            if sid and sid in SESSIONS:
-                SESSIONS[sid]["last_seen"] = now
-                _evict(now)
-                self._new_sid = None
-                return SESSIONS[sid]
+        sess = session_store.load(sid) if sid else None
+        if sess is None:
             sid = secrets.token_hex(16)
             sess = new_session()
-            SESSIONS[sid] = sess
-            _evict(now)
             self._new_sid = sid
-            return sess
+        else:
+            self._new_sid = None
+        sess["last_seen"] = time.time()
+        self._sid, self._sess = sid, sess
+        return sess
+
+    def _persist(self):
+        """
+        Write the session back, once, on the way out of a request.
+
+        Errors are logged rather than raised: this runs while a response is
+        being assembled, and failing to store the session is not a reason to
+        replace a working page with a 500. It is worth shouting about in the
+        log though — the next request will silently see stale state.
+        """
+        sid, sess = getattr(self, "_sid", None), getattr(self, "_sess", None)
+        if not sid or sess is None:
+            return
+        try:
+            session_store.save(sid, sess)
+        except session_store.SessionTooLarge as e:
+            print(f"[sessions] {sid[:8]} NOT SAVED: {e}")
+        except Exception as e:                    # noqa: BLE001
+            print(f"[sessions] {sid[:8]} NOT SAVED: {type(e).__name__}: {e}")
+        finally:
+            self._sid = self._sess = None
 
     def _send(self, body, ctype="text/html; charset=utf-8", status=200, extra=None):
+        # Before the response, never after. A serverless host may freeze the
+        # instance the moment the last byte goes out, so a write queued after
+        # this point is a write that sometimes does not happen — and the
+        # symptom is a wizard that loses a step under load and nowhere else.
+        self._persist()
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(status)
         self.send_header("Content-Type", ctype)
@@ -688,7 +716,22 @@ class Handler(BaseHTTPRequestHandler):
             return ""
         return f"{proto}://{host}"
 
+    # `_send` persists the session on the way out, which covers every route.
+    # These two are the backstop for a route that returns without responding,
+    # and for one that raises: the work already done should still be kept.
     def do_GET(self):
+        try:
+            return self._route_get()
+        finally:
+            self._persist()
+
+    def do_POST(self):
+        try:
+            return self._route_post()
+        finally:
+            self._persist()
+
+    def _route_get(self):
         parsed = urllib.parse.urlparse(self.path)
         path, qs = parsed.path, urllib.parse.parse_qs(parsed.query)
 
@@ -819,7 +862,7 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._send("Not found", status=404, ctype="text/plain")
 
-    def do_POST(self):
+    def _route_post(self):
         parsed = urllib.parse.urlparse(self.path)
         path, qs = parsed.path, urllib.parse.parse_qs(parsed.query)
 

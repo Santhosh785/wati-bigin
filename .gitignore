@@ -4,3 +4,12 @@ node_modules/
 .env
 logs/
 data/
+.vercel/
+.vercel
+.env*
+
+# Written by `vercel build` (the Python builder's uv workspace). Regenerated
+# on every build; nothing here is hand-maintained.
+.python-version
+pyproject.toml
+uv.lock

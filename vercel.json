@@ -1,0 +1,49 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": null,
+  "installCommand": null,
+  "outputDirectory": "public",
+  "functions": {
+    "api/index.py": {
+      "memory": 1024,
+      "maxDuration": 60,
+      "includeFiles": "*.py"
+    },
+    "api/cron/send.py": {
+      "memory": 1024,
+      "maxDuration": 300,
+      "includeFiles": "*.py"
+    },
+    "api/cron/retry.py": {
+      "memory": 1024,
+      "maxDuration": 120,
+      "includeFiles": "*.py"
+    },
+    "api/cron/bigin.py": {
+      "memory": 1024,
+      "maxDuration": 300,
+      "includeFiles": "*.py"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/index"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/send",
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron/retry",
+      "schedule": "23 * * * *"
+    },
+    {
+      "path": "/api/cron/bigin",
+      "schedule": "0 */3 * * *"
+    }
+  ]
+}

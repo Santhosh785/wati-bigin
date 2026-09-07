@@ -59,6 +59,13 @@ UNREADABLE_TYPES = {"profileimage"}
 def load_env(path=ENV_PATH):
     """Minimal .env reader — no dependency on python-dotenv."""
     env = dict(os.environ)
+    # A serverless deployment gets its configuration from the platform, not
+    # from a file in the bundle. Reading one there would mean credentials that
+    # silently outlive a rotation — the file is a snapshot of whatever was on
+    # the machine that built it — so on Vercel the environment is the only
+    # source. Locally nothing changes.
+    if os.environ.get("VERCEL"):
+        return env
     if os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
