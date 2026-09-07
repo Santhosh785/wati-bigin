@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bigin → WATI campaign CSV cleaner</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel2: #1e222b;
+    --border: #2a2f3a;
+    --text: #e6e9ef;
+    --muted: #9aa4b2;
+    --accent: #4f9dff;
+    --accent2: #22c55e;
+    --danger: #ef4444;
+    --warn: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    padding: 18px 24px; border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #1a1e27, #14171e);
+  }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  main { max-width: 960px; margin: 0 auto; padding: 20px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px; margin-bottom: 18px;
+  }
+  .card.disabled { opacity: .45; pointer-events: none; }
+  .card h2 {
+    margin: 0 0 14px; font-size: 14px; letter-spacing: .3px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .step-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; border-radius: 50%; background: var(--accent);
+    color: #fff; font-size: 12px; font-weight: 700; flex: none;
+  }
+  label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 5px; }
+  select, input[type=text], input[type=number] {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 8px 10px; font-size: 14px; width: 100%;
+  }
+  input[type=file] { color: var(--muted); }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 180px; }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 7px;
+    padding: 9px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button.ghost { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
+  button.green { background: var(--accent2); }
+  button.small { padding: 5px 10px; font-size: 12px; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .muted { color: var(--muted); }
+  .pill {
+    display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px;
+    background: var(--panel2); border: 1px solid var(--border);
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; }
+  .scroll { max-height: 320px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+  .filter-row {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .filter-row:last-child { border-bottom: 0; }
+  .filter-row .grow { flex: 1; }
+  .badge-keep { color: var(--accent2); }
+  .badge-remove { color: var(--danger); }
+  .vals { max-height: 220px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; padding: 4px; margin-top: 8px; }
+  .valline { display: flex; align-items: center; gap: 8px; padding: 3px 6px; }
+  .valline input { width: auto; }
+  .valline .c { color: var(--muted); font-size: 12px; }
+  .stat { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+  .stat span:last-child { font-weight: 700; }
+  .files a { color: var(--accent); text-decoration: none; }
+  .files li { margin: 4px 0; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Bigin&nbsp;→&nbsp;WATI campaign CSV cleaner</h1>
+  <p>Everything runs in your browser. Nothing is uploaded anywhere.</p>
+</header>
+
+<main>
+  <!-- STEP 1: load -->
+  <div class="card" id="card-load">
+    <h2><span class="step-num">1</span> Load the Bigin export CSV</h2>
+    <input type="file" id="file" accept=".csv,text/csv">
+    <div class="hint">Or drop a file here. Any columns are fine.</div>
+    <div id="load-info" class="muted" style="margin-top:10px;"></div>
+  </div>
+
+  <!-- STEP 2: filter -->
+  <div class="card disabled" id="card-filter">
+    <h2><span class="step-num">2</span> Filter contacts <span class="pill" id="filter-count"></span></h2>
+    <div class="toolbar">
+      <div style="flex:1; min-width:220px;">
+        <label>Add a filter on field</label>
+        <select id="filter-field"></select>
+      </div>
+      <button id="btn-addfilter" style="align-self:flex-end;">Configure filter</button>
+    </div>
+
+    <div id="filter-builder" style="display:none; margin-top:14px;">
+      <div class="row">
+        <div>
+          <label>Match mode</label>
+          <select id="filter-mode">
+            <option value="keep">Keep matching rows</option>
+            <option value="remove">Remove matching rows</option>
+          </select>
+        </div>
+        <div>
+          <label>Text search within values</label>
+          <input type="text" id="val-search" placeholder="type to narrow the list…">
+        </div>
+      </div>
+      <div class="vals" id="val-list"></div>
+      <div class="toolbar" style="margin-top:10px;">
+        <button id="btn-applyfilter" class="green">Apply filter</button>
+        <button id="btn-cancelfilter" class="ghost">Cancel</button>
+        <span class="muted" id="filter-preview"></span>
+      </div>
+    </div>
+
+    <div id="active-filters" style="margin-top:14px;"></div>
+  </div>
+
+  <!-- STEP 3: map -->
+  <div class="card disabled" id="card-map">
+    <h2><span class="step-num">3</span> Map columns to WATI format</h2>
+    <div class="row">
+      <div>
+        <label>Name column</label>
+        <select id="map-name"></select>
+      </div>
+      <div>
+        <label>Also append (optional last-name column)</label>
+        <select id="map-name2"><option value="">— none —</option></select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px;">
+      <div>
+        <label>Phone column</label>
+        <select id="map-phone"></select>
+      </div>
+      <div>
+        <label>Country code</label>
+        <input type="text" id="map-country" value="91">
+      </div>
+    </div>
+    <div class="hint">Output columns: <code>Name,CountryCode,Phone,AllowCampaign,AllowSMS</code>. Phones are cleaned to 10-digit Indian numbers and de-duplicated.</div>
+  </div>
+
+  <!-- STEP 4: batch + run -->
+  <div class="card disabled" id="card-run">
+    <h2><span class="step-num">4</span> Batch &amp; generate</h2>
+    <div class="row">
+      <div>
+        <label>Batch size (contacts per file)</label>
+        <select id="batch-size">
+          <option value="100">100</option>
+          <option value="250" selected>250</option>
+          <option value="500">500</option>
+          <option value="custom">custom…</option>
+        </select>
+      </div>
+      <div id="custom-wrap" style="display:none;">
+        <label>Custom size</label>
+        <input type="number" id="batch-custom" min="1" max="100000" value="250">
+      </div>
+    </div>
+    <div class="toolbar" style="margin-top:14px;">
+      <button id="btn-run" class="green">Generate WATI files</button>
+    </div>
+  </div>
+
+  <!-- results -->
+  <div class="card disabled" id="card-result">
+    <h2><span class="step-num">✓</span> Result</h2>
+    <div class="row">
+      <div style="min-width:260px;">
+        <div class="stat"><span>Loaded from CSV</span><span id="r-loaded">0</span></div>
+        <div class="stat"><span>After filtering</span><span id="r-filtered">0</span></div>
+        <div class="stat"><span>Skipped (bad/dupe)</span><span id="r-skipped">0</span></div>
+        <div class="stat"><span>Valid WATI contacts</span><span id="r-good">0</span></div>
+        <div class="stat"><span>Batches</span><span id="r-batches">0</span></div>
+      </div>
+      <div style="min-width:260px;">
+        <label>Download files</label>
+        <ul class="files" id="file-list" style="padding-left:18px;"></ul>
+      </div>
+    </div>
+    <div style="margin-top:14px;">
+      <label>Preview — first valid batch</label>
+      <div class="scroll"><table id="preview-table"></table></div>
+    </div>
+  </div>
+</main>
+
+<script>
+/* ------------------------------------------------------------------ *
+ * Logic ported 1:1 from wati_cleanup.py
+ * ------------------------------------------------------------------ */
+const WATI_HEADER = ["Name", "CountryCode", "Phone", "AllowCampaign", "AllowSMS"];
+const NAME_HINTS = ["full name", "contact name", "name", "first name"];
+const LAST_NAME_HINTS = ["last name"];
+const PHONE_HINTS = ["mobile", "phone", "mobile phone", "whatsapp", "contact number", "number"];
+
+const state = {
+  headers: [],
+  rows: [],          // original loaded rows
+  filtered: [],      // rows after active filters
+  filters: [],       // {col, values:Set, mode}
+  totalIn: 0,
+};
+
+/* --- minimal RFC-4180 CSV parser (handles quotes, commas, newlines, BOM) --- */
+function parseCSV(text) {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // strip BOM
+  const rows = [];
+  let field = "", row = [], inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQ = false;
+      } else field += c;
+    } else {
+      if (c === '"') inQ = true;
+      else if (c === ',') { row.push(field); field = ""; }
+      else if (c === '\n') { row.push(field); rows.push(row); field = ""; row = []; }
+      else if (c === '\r') { /* skip */ }
+      else field += c;
+    }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  if (!rows.length) return { headers: [], records: [] };
+  const headers = rows[0].map(h => h.trim());
+  const records = [];
+  for (let r = 1; r < rows.length; r++) {
+    if (rows[r].length === 1 && rows[r][0] === "") continue; // blank line
+    const obj = {};
+    headers.forEach((h, idx) => { obj[h] = rows[r][idx] !== undefined ? rows[r][idx] : ""; });
+    records.push(obj);
+  }
+  return { headers, records };
+}
+
+function suggestColumn(headers, hints) {
+  const lowered = {};
+  headers.forEach(h => lowered[h] = h.toLowerCase().trim());
+  for (const hint of hints) for (const h of headers) if (lowered[h] === hint) return h;
+  for (const hint of hints) for (const h of headers) if (lowered[h].includes(hint)) return h;
+  return null;
+}
+
+function cleanPhone(raw) {
+  if (raw === null || raw === undefined) return null;
+  let digits = String(raw).replace(/\D/g, "");
+  if (!digits) return null;
+  if (digits.length === 12 && digits.startsWith("91")) digits = digits.slice(2);
+  else if (digits.length === 13 && digits.startsWith("091")) digits = digits.slice(3);
+  else if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
+  if (digits.length === 10) return digits;
+  return null;
+}
+
+function buildWatiRows(rows, nameCols, phoneCol, country) {
+  const good = [], skipped = [], seen = new Set();
+  for (const r of rows) {
+    const name = nameCols.map(c => (r[c] || "").trim()).join(" ").trim();
+    const phone = cleanPhone(r[phoneCol]);
+    if (!phone) { skipped.push({ ...r, _skip_reason: "invalid/missing phone" }); continue; }
+    if (seen.has(phone)) { skipped.push({ ...r, _skip_reason: "duplicate phone" }); continue; }
+    seen.add(phone);
+    good.push({
+      Name: name || "Contact",
+      CountryCode: country,
+      Phone: phone,
+      AllowCampaign: "True",
+      AllowSMS: "True",
+    });
+  }
+  return { good, skipped };
+}
+
+/* --- CSV writer --- */
+function toCSV(fields, records) {
+  const esc = v => {
+    v = v === null || v === undefined ? "" : String(v);
+    return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+  };
+  const lines = [fields.map(esc).join(",")];
+  for (const rec of records) lines.push(fields.map(f => esc(rec[f])).join(","));
+  return lines.join("\r\n");
+}
+
+/* ------------------------------------------------------------------ *
+ * UI wiring
+ * ------------------------------------------------------------------ */
+const $ = id => document.getElementById(id);
+
+function enable(cardId, on = true) {
+  $(cardId).classList.toggle("disabled", !on);
+}
+
+function applyFilters() {
+  state.filtered = state.rows.filter(r => {
+    for (const f of state.filters) {
+      const v = (r[f.col] || "").trim();
+      const isMatch = f.values.has(v);
+      const keep = f.mode === "keep" ? isMatch : !isMatch;
+      if (!keep) return false;
+    }
+    return true;
+  });
+  $("filter-count").textContent = state.filtered.length + " contacts";
+  renderActiveFilters();
+}
+
+function renderActiveFilters() {
+  const box = $("active-filters");
+  if (!state.filters.length) { box.innerHTML = '<span class="muted">No filters applied.</span>'; return; }
+  box.innerHTML = "";
+  state.filters.forEach((f, i) => {
+    const div = document.createElement("div");
+    div.className = "filter-row";
+    const cls = f.mode === "keep" ? "badge-keep" : "badge-remove";
+    const label = f.mode === "keep" ? "KEEP" : "REMOVE";
+    const vals = [...f.values].map(v => v === "" ? "(blank)" : v).join(", ");
+    div.innerHTML = `<span class="grow"><b class="${cls}">${label}</b> where <b>${escapeHtml(f.col)}</b> ∈ {${escapeHtml(vals)}}</span>`;
+    const rm = document.createElement("button");
+    rm.className = "ghost small"; rm.textContent = "remove";
+    rm.onclick = () => { state.filters.splice(i, 1); applyFilters(); };
+    div.appendChild(rm);
+    box.appendChild(div);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+let builderState = null;
+
+function openBuilder() {
+  const col = $("filter-field").value;
+  const counts = {};
+  for (const r of state.filtered) {
+    const v = (r[col] || "").trim();
+    counts[v] = (counts[v] || 0) + 1;
+  }
+  const distinct = Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].toLowerCase().localeCompare(b[0].toLowerCase()));
+  builderState = { col, distinct, selected: new Set() };
+  $("filter-builder").style.display = "block";
+  $("val-search").value = "";
+  $("filter-mode").value = "keep";
+  renderValList();
+}
+
+function renderValList() {
+  const q = $("val-search").value.toLowerCase();
+  const box = $("val-list");
+  box.innerHTML = "";
+  let shown = 0;
+  for (const [v, c] of builderState.distinct) {
+    if (q && !v.toLowerCase().includes(q)) continue;
+    if (shown++ > 500) break;
+    const line = document.createElement("label");
+    line.className = "valline";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = builderState.selected.has(v);
+    cb.onchange = () => { cb.checked ? builderState.selected.add(v) : builderState.selected.delete(v); updatePreview(); };
+    line.appendChild(cb);
+    const txt = document.createElement("span");
+    txt.innerHTML = `${escapeHtml(v === "" ? "(blank)" : v)} <span class="c">(${c})</span>`;
+    line.appendChild(txt);
+    box.appendChild(line);
+  }
+  updatePreview();
+}
+
+function updatePreview() {
+  const sel = builderState.selected;
+  let n = 0;
+  for (const [v, c] of builderState.distinct) if (sel.has(v)) n += c;
+  $("filter-preview").textContent = sel.size ? `${n} row(s) match ${sel.size} value(s).` : "select value(s)…";
+}
+
+/* --- file loading --- */
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const { headers, records } = parseCSV(reader.result);
+    if (!headers.length) { $("load-info").textContent = "The file appears to be empty."; return; }
+    state.headers = headers;
+    state.rows = records;
+    state.filtered = records.slice();
+    state.filters = [];
+    state.totalIn = records.length;
+
+    $("load-info").innerHTML = `Loaded <b>${records.length}</b> contacts, <b>${headers.length}</b> columns: <span class="muted">${headers.map(escapeHtml).join(" · ")}</span>`;
+
+    // populate selects
+    fillSelect("filter-field", headers);
+    fillSelect("map-name", headers, suggestColumn(headers, NAME_HINTS));
+    fillSelect("map-name2", headers, suggestColumn(headers, LAST_NAME_HINTS), true);
+    fillSelect("map-phone", headers, suggestColumn(headers, PHONE_HINTS));
+
+    enable("card-filter"); enable("card-map"); enable("card-run");
+    enable("card-result", false);
+    $("filter-builder").style.display = "none";
+    applyFilters();
+  };
+  reader.readAsText(file);
+}
+
+function fillSelect(id, headers, selected, allowNone) {
+  const sel = $(id);
+  sel.innerHTML = "";
+  if (allowNone) sel.appendChild(new Option("— none —", ""));
+  headers.forEach(h => sel.appendChild(new Option(h, h)));
+  if (selected) sel.value = selected;
+}
+
+/* --- run --- */
+let downloadUrls = [];
+function run() {
+  const nameCols = [$("map-name").value];
+  const n2 = $("map-name2").value;
+  if (n2 && n2 !== nameCols[0]) nameCols.push(n2);
+  const phoneCol = $("map-phone").value;
+  const country = $("map-country").value.trim() || "91";
+
+  const { good, skipped } = buildWatiRows(state.filtered, nameCols, phoneCol, country);
+
+  let size = $("batch-size").value;
+  size = size === "custom" ? Math.max(1, parseInt($("batch-custom").value || "250", 10)) : parseInt(size, 10);
+
+  // batches
+  const batches = [];
+  for (let i = 0; i < good.length; i += size) batches.push(good.slice(i, i + size));
+
+  // build download links
+  downloadUrls.forEach(u => URL.revokeObjectURL(u));
+  downloadUrls = [];
+  const list = $("file-list");
+  list.innerHTML = "";
+
+  batches.forEach((chunk, idx) => {
+    const csv = toCSV(WATI_HEADER, chunk);
+    addDownload(list, `wati_batch_${idx + 1}.csv`, csv, `${chunk.length} contacts`);
+  });
+  if (skipped.length) {
+    const fields = Object.keys(skipped[0]);
+    addDownload(list, "skipped.csv", toCSV(fields, skipped), `${skipped.length} rows`, true);
+  }
+  if (!batches.length) list.innerHTML = '<li class="muted">No valid contacts to write.</li>';
+
+  // stats
+  $("r-loaded").textContent = state.totalIn;
+  $("r-filtered").textContent = state.filtered.length;
+  $("r-skipped").textContent = skipped.length;
+  $("r-good").textContent = good.length;
+  $("r-batches").textContent = batches.length;
+
+  // preview
+  renderPreview(batches[0] || []);
+  enable("card-result");
+  $("card-result").scrollIntoView({ behavior: "smooth" });
+}
+
+function addDownload(list, name, csv, note, warn) {
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  downloadUrls.push(url);
+  const li = document.createElement("li");
+  const a = document.createElement("a");
+  a.href = url; a.download = name; a.textContent = name;
+  li.appendChild(a);
+  const s = document.createElement("span");
+  s.className = "muted"; s.style.marginLeft = "8px";
+  s.textContent = "(" + note + ")";
+  if (warn) s.style.color = "var(--warn)";
+  li.appendChild(s);
+  list.appendChild(li);
+}
+
+function renderPreview(rows) {
+  const t = $("preview-table");
+  let html = "<tr>" + WATI_HEADER.map(h => `<th>${h}</th>`).join("") + "</tr>";
+  rows.slice(0, 50).forEach(r => {
+    html += "<tr>" + WATI_HEADER.map(h => `<td>${escapeHtml(r[h])}</td>`).join("") + "</tr>";
+  });
+  if (!rows.length) html += `<tr><td colspan="5" class="muted">nothing to preview</td></tr>`;
+  t.innerHTML = html;
+}
+
+/* --- events --- */
+$("file").addEventListener("change", e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+
+const dz = $("card-load");
+["dragover", "dragenter"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.style.borderColor = "var(--accent)"; }));
+["dragleave", "drop"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.style.borderColor = ""; }));
+dz.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) loadFile(f); });
+
+$("btn-addfilter").onclick = openBuilder;
+$("btn-cancelfilter").onclick = () => { $("filter-builder").style.display = "none"; };
+$("val-search").addEventListener("input", renderValList);
+$("btn-applyfilter").onclick = () => {
+  if (!builderState || !builderState.selected.size) { $("filter-preview").textContent = "select at least one value."; return; }
+  state.filters.push({ col: builderState.col, values: new Set(builderState.selected), mode: $("filter-mode").value });
+  $("filter-builder").style.display = "none";
+  applyFilters();
+};
+
+$("batch-size").addEventListener("change", e => {
+  $("custom-wrap").style.display = e.target.value === "custom" ? "block" : "none";
+});
+$("btn-run").onclick = run;
+</script>
+</body>
+</html>

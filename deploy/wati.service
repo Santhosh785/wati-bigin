@@ -1,0 +1,31 @@
+[Unit]
+Description=Bigin -> WATI campaign cleaner + sender (Python backend)
+After=network.target
+
+# This process also runs the WATI campaign scheduler, so stopping the service
+# stops scheduled sends. Nothing is lost — campaigns live in MongoDB and are
+# picked up again on the next start, resuming mid-list without re-sending —
+# but a campaign due while the service is down goes out late, not on time.
+# Run ONE instance: a second one would compete for the same campaigns (it is
+# prevented from double-sending them, but there is no reason to have it).
+
+[Service]
+Type=simple
+# Change User/Group and paths to match your server.
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/wati_cleanup/backend/python
+Environment=HOST=127.0.0.1
+Environment=PORT=8000
+ExecStart=/usr/bin/python3 /opt/wati_cleanup/backend/python/app.py
+Restart=always
+RestartSec=2
+
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

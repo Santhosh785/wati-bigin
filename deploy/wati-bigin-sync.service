@@ -1,0 +1,25 @@
+[Unit]
+Description=Bigin -> MongoDB contact sync (one shot; driven by wati-bigin-sync.timer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Change User/Group and paths to match your server.
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/wati_cleanup/backend/python
+ExecStart=/usr/bin/python3 /opt/wati_cleanup/backend/python/bigin_sync.py
+# Zoho or Atlas being briefly unreachable should not kill the schedule;
+# the timer just tries again in 3 hours.
+SuccessExitStatus=0
+TimeoutStartSec=1800
+
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

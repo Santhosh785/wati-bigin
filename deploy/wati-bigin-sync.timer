@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the Bigin -> MongoDB contact sync every 3 hours
+
+[Timer]
+# First run 5 min after boot, then every 3 hours.
+OnBootSec=5min
+OnUnitActiveSec=3h
+# If the machine was off when a run was due, run once on the next boot.
+Persistent=true
+# Spread the load a little so every timer on the box doesn't fire at once.
+RandomizedDelaySec=2min
+Unit=wati-bigin-sync.service
+
+[Install]
+WantedBy=timers.target
